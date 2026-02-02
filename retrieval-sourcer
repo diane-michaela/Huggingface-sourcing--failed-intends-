@@ -1,0 +1,563 @@
+"""
+Hugging Face Retrieval/Search Sourcer (models + datasets) + author enrichment:
+- Searches Hugging Face Hub for models/datasets using a retrieval-focused query plan (multiple small queries).
+- Aggregates + de-dupes results.
+- Filters by lastModified year range (default: 2023–2026 inclusive).
+- Enriches author namespaces (cached): name/fullname, bio, avatar, website, twitter/X, LinkedIn (if present), extra links.
+- Writes clickable Excel (repo + author links + social links), falls back to CSV.
+
+OUTPUT: hf_retrieval_models_datasets_with_author_details.xlsx
+Requires: requests, pandas, openpyxl
+"""
+
+import os
+import re
+import time
+import random
+import typing as t
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote_plus, urlparse
+
+import requests
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font
+from requests.exceptions import ReadTimeout, ConnectionError, HTTPError
+
+# ---------------- Config ----------------
+HF_BASE = "https://huggingface.co"
+
+# Retrieval-focused query plan (multiple small searches, aggregated)
+MODEL_QUERIES_CORE = [
+    "embedding",
+    "retrieval",
+    "reranker",
+    "ranker",
+]
+MODEL_QUERIES_EXTENDED = [
+    "dense retrieval",
+    "bi-encoder",
+    "cross-encoder",
+    "dual encoder",
+    "colbert",
+    "splade",
+    "contriever",
+]
+
+DATASET_QUERIES_CORE = [
+    "retrieval",
+    "ranking",
+    "query",
+]
+DATASET_QUERIES_EXTENDED = [
+    "qrels",
+    "hard negatives",
+    "triplets",
+    "query passage",
+    "query-document pairs",
+    "pairwise ranking",
+]
+
+# Date filter (inclusive) based on lastModified (best-available timestamp on HF)
+START_YEAR = 2023
+END_YEAR = 2026
+
+# Limits / pacing
+MAX_ASSETS_TOTAL = 1000           # models + datasets combined
+LIMIT_PER_QUERY = 200             # per query per endpoint (tune for noise/coverage)
+TIMEOUT = 20
+
+PAGE_SLEEP_RANGE = (0.15, 0.6)    # gentle pacing between queries
+
+DEFAULT_XLSX = "hf_retrieval_models_datasets_with_author_details.xlsx"
+
+# ---------------- Token -----------------
+# Token is optional for public metadata, but recommended.
+# Preferred env var: HF_TOKEN (or HUGGINGFACEHUB_API_TOKEN).
+# Optional: token_hf.py with HF_TOKEN="..."
+try:
+    from token_hf import HF_TOKEN as FILE_TOKEN  # type: ignore
+except Exception:
+    FILE_TOKEN = ""
+
+ENV_TOKEN = os.getenv("HF_TOKEN", "") or os.getenv("HUGGINGFACEHUB_API_TOKEN", "") or ""
+TOKEN = ENV_TOKEN or FILE_TOKEN or ""
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "Accept": "application/json",
+    "User-Agent": "hf-retrieval-sourcer-script/1.0",
+})
+
+# HF supports bearer token auth (recommended format)
+if TOKEN:
+    SESSION.headers.update({"Authorization": f"Bearer {TOKEN}"})
+else:
+    print("No HF token found (HF_TOKEN / HUGGINGFACEHUB_API_TOKEN env var or token_hf.py). Running unauthenticated.")
+
+
+def _print_auth_diagnostics() -> None:
+    source = "env:HF_TOKEN/HUGGINGFACEHUB_API_TOKEN" if ENV_TOKEN else ("token_hf.py:HF_TOKEN" if FILE_TOKEN else "none")
+    print(f"Token source: {source}")
+    print(f"Authorization header present: {'Authorization' in SESSION.headers}")
+
+
+# ---------------- Helpers ----------------
+def safe_output_path(filename: str) -> Path:
+    p = Path(__file__).with_name(filename)
+    try:
+        p.touch(exist_ok=True)
+        return p
+    except PermissionError:
+        return p.with_name(p.stem + "_new" + p.suffix)
+
+
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
+    url = str(url).strip()
+    if not url:
+        return ""
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        return url if urlparse(url).netloc else ""
+    except Exception:
+        return ""
+
+
+def urls_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    urls = re.findall(r"(https?://[^\s)]+)", text, flags=re.IGNORECASE)
+    out: list[str] = []
+    for u in urls:
+        nu = normalize_url(u.rstrip(".,);]}>\"'"))
+        if nu and nu not in out:
+            out.append(nu)
+    return out
+
+
+def extract_first_linkedin(*fields: str) -> str:
+    for field in fields:
+        if not field:
+            continue
+        # Find explicit URLs
+        for u in urls_from_text(field):
+            if "linkedin.com" in u.lower():
+                return u
+        # Or partial linkedin.com paths
+        s = field.strip()
+        if "linkedin.com" in s.lower():
+            idx = s.lower().find("linkedin.com")
+            candidate = s[idx:].split()[0].strip().rstrip(".,);]}>\"'")
+            return normalize_url(candidate)
+    return ""
+
+
+def parse_iso8601(dt: str) -> t.Optional[datetime]:
+    """
+    HF often returns lastModified like: '2024-01-03T12:34:56.000Z'
+    We'll parse defensively.
+    """
+    if not dt:
+        return None
+    dt = dt.strip()
+    # Normalize Z
+    try:
+        if dt.endswith("Z"):
+            dt = dt.replace("Z", "+00:00")
+        # datetime.fromisoformat handles fractional seconds with offset
+        return datetime.fromisoformat(dt)
+    except Exception:
+        # fallback for some formats
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+            try:
+                return datetime.strptime(dt, fmt)
+            except Exception:
+                continue
+    return None
+
+
+def year_in_range_from_last_modified(last_modified: str) -> bool:
+    d = parse_iso8601(last_modified)
+    if not d:
+        return False
+    return START_YEAR <= d.year <= END_YEAR
+
+
+def write_excel_with_fallback(df: pd.DataFrame, filename: str) -> Path:
+    out = safe_output_path(filename)
+    try:
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+
+        wb = load_workbook(out)
+        ws = wb.active
+        headers = {c.value: i for i, c in enumerate(next(ws.iter_rows(min_row=1, max_row=1)), start=1)}
+
+        link_cols = {
+            "asset_url": "Repo",
+            "author_profile_url": "Author",
+            "author_website": "Website",
+            "author_x": "X",
+            "author_linkedin": "LinkedIn",
+            "author_github": "GitHub",
+        }
+
+        for r in range(2, ws.max_row + 1):
+            for col, label in link_cols.items():
+                idx = headers.get(col)
+                if not idx:
+                    continue
+                cell = ws.cell(row=r, column=idx)
+                val = (cell.value or "").strip()
+                if not val:
+                    continue
+                url = val.split(";")[0].strip()
+                if url.lower().startswith(("http://", "https://")):
+                    cell.hyperlink = url
+                    cell.value = label
+                    cell.font = Font(color="0563C1", underline="single")
+
+        wb.save(out)
+        print(f"Excel written: {out.resolve()} ({len(df)} rows)")
+        return out
+
+    except Exception as e:
+        print("Excel failed, falling back to CSV:", e)
+        out_csv = out.with_suffix(".csv")
+        df.to_csv(out_csv, index=False)
+        print(f"CSV written: {out_csv.resolve()} ({len(df)} rows)")
+        return out_csv
+
+
+def get(url: str) -> requests.Response:
+    """Resilient GET with retries on transient errors + basic throttling."""
+    max_attempts = 6
+    base_sleep = 1.8
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = SESSION.get(url, timeout=TIMEOUT)
+
+            # Basic throttling handling
+            if resp.status_code in (429, 503, 502, 504):
+                sleep = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
+                print(f"Transient {resp.status_code}. Retry {attempt}/{max_attempts} in {sleep:.1f}s")
+                time.sleep(sleep)
+                continue
+
+            # Some HF endpoints may return 401 if token is invalid; fail fast.
+            if resp.status_code == 401:
+                raise RuntimeError("Unauthorized (401). Check HF_TOKEN / token validity.")
+
+            resp.raise_for_status()
+            return resp
+
+        except (ReadTimeout, ConnectionError, HTTPError) as e:
+            last_exc = e
+            sleep = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
+            print(f"Error {e}. Retry {attempt}/{max_attempts} in {sleep:.1f}s")
+            time.sleep(sleep)
+
+    raise RuntimeError(f"GET failed after retries: {last_exc}")
+
+
+# ---------------- HF API Calls ----------------
+def hf_search_assets(asset_type: str, query: str, limit: int) -> list[dict]:
+    """
+    asset_type: 'models' or 'datasets'
+    Uses Hugging Face Hub API:
+      GET https://huggingface.co/api/models?search=...&limit=...&full=true
+      GET https://huggingface.co/api/datasets?search=...&limit=...&full=true
+    """
+    q = quote_plus(query.strip())
+    url = f"{HF_BASE}/api/{asset_type}?search={q}&limit={limit}&full=true"
+    return get(url).json() or []
+
+
+# Author enrichment cache
+_AUTHOR_CACHE: dict[str, dict] = {}
+
+
+def hf_fetch_author(namespace: str) -> dict:
+    """
+    Fetch HF user/org profile info.
+
+    - Try user endpoint first
+    - If 404, try org endpoint
+    - 404 returns {} (no retries)
+    """
+    if not namespace:
+        return {}
+    if namespace in _AUTHOR_CACHE:
+        return _AUTHOR_CACHE[namespace]
+
+    def _fetch(url: str) -> dict:
+        try:
+            r = SESSION.get(url, timeout=TIMEOUT)
+
+            # 404 is not transient -> do not retry
+            if r.status_code == 404:
+                return {}
+
+            # transient -> let our retry get() handle it
+            if r.status_code in (429, 502, 503, 504):
+                return get(url).json() or {}
+
+            if r.status_code == 401:
+                raise RuntimeError("Unauthorized (401). Check HF token validity/permissions.")
+
+            r.raise_for_status()
+            return r.json() or {}
+        except Exception:
+            return {}
+
+    user_url = f"{HF_BASE}/api/users/{quote_plus(namespace)}"
+    org_url = f"{HF_BASE}/api/organizations/{quote_plus(namespace)}"
+
+    data = _fetch(user_url)
+    if not data:
+        data = _fetch(org_url)
+
+    _AUTHOR_CACHE[namespace] = data or {}
+    return _AUTHOR_CACHE[namespace]
+
+
+
+def author_fields(author_json: dict) -> dict:
+    """
+    Extract what we can from HF user JSON.
+    Field names vary over time; we read defensively.
+    """
+    # Common-ish keys seen in HF user payloads
+    # We'll gracefully handle missing.
+    display = (author_json.get("name") or author_json.get("fullname") or author_json.get("fullName") or "").strip()
+    bio = (author_json.get("bio") or "").strip()
+
+    website_raw = (author_json.get("website") or author_json.get("websiteUrl") or author_json.get("url") or "").strip()
+    website = normalize_url(website_raw)
+
+    twitter = (author_json.get("twitterUsername") or author_json.get("twitter") or "").strip()
+    x_url = normalize_url(f"https://twitter.com/{twitter}") if twitter else ""
+
+    # Some profiles include social links embedded in bio
+    linkedin = extract_first_linkedin(website_raw, bio)
+
+    # GitHub often appears in bio or website
+    github = ""
+    for u in urls_from_text(" ".join([website_raw, bio])):
+        if "github.com" in u.lower():
+            github = u
+            break
+
+    extra = urls_from_text(bio)
+    for known in [website, linkedin, x_url, github]:
+        if known and known in extra:
+            extra.remove(known)
+    extra_links = "; ".join(extra)
+
+    return {
+        "author_display_name": display,
+        "author_bio": bio,
+        "author_website": website,
+        "author_x": x_url,
+        "author_linkedin": linkedin,
+        "author_github": github,
+        "author_extra_links": extra_links,
+    }
+
+
+def compute_retrieval_score(asset: dict, asset_type: str, matched_terms: set[str]) -> int:
+    """
+    Simple heuristic score (0–100) focusing on retrieval/search signals.
+    Keeps it transparent for recruiters.
+    """
+    score = 0
+
+    tags = [t.lower() for t in (asset.get("tags") or []) if isinstance(t, str)]
+    pipeline = (asset.get("pipeline_tag") or asset.get("pipelineTag") or "")
+    pipeline = str(pipeline).lower()
+
+    # Term hits
+    score += min(40, 10 * len(matched_terms))  # up to 40
+
+    # Tags/pipeline signals
+    retrieval_signals = ["information-retrieval", "text-ranking", "sentence-similarity", "feature-extraction", "embedding"]
+    if any(s in tags for s in retrieval_signals):
+        score += 20
+    if any(s in pipeline for s in ["text-ranking", "sentence-similarity", "feature-extraction"]):
+        score += 10
+
+    # Popularity (very light; avoid biasing too hard)
+    downloads = int(asset.get("downloads") or 0)
+    likes = int(asset.get("likes") or 0)
+
+    if downloads >= 10000:
+        score += 10
+    elif downloads >= 1000:
+        score += 6
+    elif downloads >= 200:
+        score += 3
+
+    if likes >= 200:
+        score += 10
+    elif likes >= 50:
+        score += 6
+    elif likes >= 10:
+        score += 3
+
+    # Dataset-specific boost for evaluation terms
+    if asset_type == "dataset":
+        if any(k in " ".join(tags) for k in ["qrels", "triplet", "hard-negative", "hard negatives"]):
+            score += 10
+
+    return max(0, min(100, score))
+
+
+# ---------------- Main aggregation logic ----------------
+def run_queries(asset_type: str, queries: list[str], limit_per_query: int) -> dict[str, dict]:
+    """
+    Runs multiple queries, aggregates and de-dupes by repo id.
+    Returns dict: repo_id -> record dict {asset_json, matched_terms}
+    """
+    results: dict[str, dict] = {}
+
+    for q in queries:
+        print(f"[{asset_type}] query='{q}'")
+        items = hf_search_assets("models" if asset_type == "model" else "datasets", q, limit_per_query)
+
+        for it in items:
+            repo_id = it.get("id") or it.get("modelId") or it.get("_id") or ""
+            if not repo_id:
+                continue
+
+            # Filter by lastModified year range (best available)
+            last_modified = it.get("lastModified") or it.get("last_modified") or ""
+            if not year_in_range_from_last_modified(str(last_modified)):
+                continue
+
+            bucket = results.get(repo_id)
+            if not bucket:
+                results[repo_id] = {
+                    "asset": it,
+                    "matched_terms": {q.lower()},
+                }
+            else:
+                bucket["matched_terms"].add(q.lower())
+
+        time.sleep(random.uniform(*PAGE_SLEEP_RANGE))
+
+    return results
+
+
+def build_rows(model_hits: dict[str, dict], dataset_hits: dict[str, dict]) -> list[dict]:
+    rows: list[dict] = []
+
+    def add_asset(repo_id: str, payload: dict, asset_type: str) -> None:
+        asset = payload["asset"]
+        matched_terms: set[str] = payload["matched_terms"]
+
+        # Author/namespace: usually the part before '/' in id.
+        namespace = repo_id.split("/")[0] if "/" in repo_id else ""
+        author_profile_url = f"{HF_BASE}/{namespace}" if namespace else ""
+
+        ajson = hf_fetch_author(namespace) if namespace else {}
+        a = author_fields(ajson) if ajson else {
+            "author_display_name": "",
+            "author_bio": "",
+            "author_website": "",
+            "author_x": "",
+            "author_linkedin": "",
+            "author_github": "",
+            "author_extra_links": "",
+        }
+
+        asset_url = f"{HF_BASE}/{repo_id}"
+        last_modified = str(asset.get("lastModified") or asset.get("last_modified") or "")
+
+        tags = asset.get("tags") or []
+        if isinstance(tags, list):
+            tags_str = "; ".join([str(x) for x in tags if x is not None])
+        else:
+            tags_str = str(tags)
+
+        pipeline = asset.get("pipeline_tag") or asset.get("pipelineTag") or ""
+        license_ = asset.get("license") or ""
+        if isinstance(license_, dict):
+            license_ = license_.get("name") or license_.get("id") or str(license_)
+        license_ = str(license_)
+
+        score = compute_retrieval_score(asset, "model" if asset_type == "model" else "dataset", matched_terms)
+
+        rows.append({
+            "asset_type": asset_type,
+            "repo_id": repo_id,
+            "asset_url": asset_url,
+
+            "author_namespace": namespace,
+            "author_profile_url": author_profile_url,
+
+            "last_modified": last_modified,
+            "downloads": int(asset.get("downloads") or 0),
+            "likes": int(asset.get("likes") or 0),
+            "license": license_,
+            "pipeline_tag": str(pipeline),
+            "tags": tags_str,
+
+            "matched_keywords": "; ".join(sorted(matched_terms)),
+            "score": score,
+
+            "author_display_name": a["author_display_name"],
+            "author_bio": a["author_bio"],
+            "author_website": a["author_website"],
+            "author_x": a["author_x"],
+            "author_linkedin": a["author_linkedin"],
+            "author_github": a["author_github"],
+            "author_extra_links": a["author_extra_links"],
+        })
+
+    # Prioritize by score later; but keep insertion order reasonable.
+    for repo_id, payload in model_hits.items():
+        add_asset(repo_id, payload, "model")
+        if len(rows) >= MAX_ASSETS_TOTAL:
+            return rows
+
+    for repo_id, payload in dataset_hits.items():
+        add_asset(repo_id, payload, "dataset")
+        if len(rows) >= MAX_ASSETS_TOTAL:
+            return rows
+
+    return rows
+
+
+def main() -> None:
+    _print_auth_diagnostics()
+
+    # Queries: core + optional extended (you can comment out extended to reduce noise)
+    model_queries = MODEL_QUERIES_CORE + MODEL_QUERIES_EXTENDED
+    dataset_queries = DATASET_QUERIES_CORE + DATASET_QUERIES_EXTENDED
+
+    model_hits = run_queries("model", model_queries, LIMIT_PER_QUERY)
+    dataset_hits = run_queries("dataset", dataset_queries, LIMIT_PER_QUERY)
+
+    print(f"Unique models kept (date-filtered): {len(model_hits)}")
+    print(f"Unique datasets kept (date-filtered): {len(dataset_hits)}")
+
+    rows = build_rows(model_hits, dataset_hits)
+    print(f"Unique authors cached: {len(_AUTHOR_CACHE)}")
+
+
+    # Sort: highest score first, then downloads, then likes
+    df = pd.DataFrame(rows).fillna("")
+    if not df.empty:
+        df = df.sort_values(by=["score", "downloads", "likes"], ascending=[False, False, False])
+
+    write_excel_with_fallback(df, DEFAULT_XLSX)
+
+
+if __name__ == "__main__":
+    main()
