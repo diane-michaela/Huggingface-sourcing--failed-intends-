@@ -95,8 +95,7 @@ You ran the script from PowerShell because:
 
 Command used:
 
-cd C:\Users\Diane Rocher\Desktop\API
-python huggingface_retrieval_sourcer_excel.py
+cd C:\Users\where-you-store-your-code
 
 
 This is the most reliable way to run sourcing scripts.
